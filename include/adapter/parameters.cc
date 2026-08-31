@@ -169,6 +169,48 @@ namespace Parameters
                         flap_location,
                         "PF x-location",
                         Patterns::Double(-3, 3));
+
+      // Optional propeller loads (received from the fluid)
+      prm.add_parameter("Enable propeller loads",
+                        prop_enabled,
+                        "Read actuator-disk propeller loads via preCICE",
+                        Patterns::Bool());
+
+      prm.add_parameter("Propeller mesh name",
+                        prop_mesh_name,
+                        "Name of the received propeller hub mesh",
+                        Patterns::Anything());
+
+      prm.add_parameter("Propeller force data name",
+                        prop_force_data_name,
+                        "Name of the thrust data on the propeller mesh",
+                        Patterns::Anything());
+
+      prm.add_parameter("Propeller torque data name",
+                        prop_torque_data_name,
+                        "Name of the torque data on the propeller mesh",
+                        Patterns::Anything());
+
+      // Optional control-surface hinge loads
+      prm.add_parameter("Enable hinge loads",
+                        hinge_enabled,
+                        "Read control-surface hinge loads via preCICE",
+                        Patterns::Bool());
+
+      prm.add_parameter("Hinge mesh name",
+                        hinge_mesh_name,
+                        "Name of the received hinge mesh",
+                        Patterns::Anything());
+
+      prm.add_parameter("Hinge force data name",
+                        hinge_force_data_name,
+                        "Name of the hinge force data",
+                        Patterns::Anything());
+
+      prm.add_parameter("Hinge moment data name",
+                        hinge_moment_data_name,
+                        "Name of the hinge moment data",
+                        Patterns::Anything());
     }
     prm.leave_subsection();
   }

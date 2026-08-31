@@ -95,6 +95,18 @@ namespace Parameters
     double      flap_location    = 0.0;
     bool        data_consistent  = true;
 
+    // Optional actuator-disk propeller loads received from the fluid
+    bool        prop_enabled         = false;
+    std::string prop_mesh_name       = "Propeller-Mesh";
+    std::string prop_force_data_name = "Thrust";
+    std::string prop_torque_data_name = "PropTorque";
+
+    // Optional control-surface hinge loads received from the fluid
+    bool         hinge_enabled         = false;
+    std::string  hinge_mesh_name       = "Control-Mesh";
+    std::string  hinge_force_data_name = "HingeForce";
+    std::string  hinge_moment_data_name = "HingeMoment";
+
     void
     add_output_parameters(ParameterHandler &prm);
   };

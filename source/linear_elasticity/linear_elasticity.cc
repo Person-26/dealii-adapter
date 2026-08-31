@@ -60,6 +60,8 @@ namespace Linear_Elasticity
     , mapping(MappingQGeneric<dim>(parameters.poly_degree))
     , quad_order(parameters.poly_degree + 1)
     , body_force_enabled(parameters.body_force.norm() > 1e-15)
+    , prop_enabled(parameters.prop_enabled)
+    , hinge_enabled(parameters.hinge_enabled)
     , timer(std::cout, TimerOutput::summary, TimerOutput::wall_times)
     , time(parameters.end_time, parameters.delta_t)
     , adapter(parameters, interface_boundary_id)
@@ -394,6 +396,14 @@ namespace Linear_Elasticity
     if (body_force_enabled)
       system_rhs.add(1, body_force_vector);
 
+    // Add the propeller point load + couple, if enabled
+    if (prop_enabled)
+      add_propeller_rhs();
+
+    // Add the control-surface hinge point load + couple, if enabled
+    if (hinge_enabled)
+      add_hinge_rhs();
+
     // Assemble global RHS:
     // RHS=(M-theta*(1-theta)*delta_t^2*K)*V_n - delta_t*K* D_n +
     // delta_t*theta*F_n+1 + delta_t*(1-theta)*F_n
@@ -516,6 +526,235 @@ namespace Linear_Elasticity
         for (unsigned int i = 0; i < dofs_per_cell; ++i)
           {
             system_rhs(local_dof_indices[i]) += cell_rhs(i);
+          }
+      }
+  }
+
+
+
+  // Apply a point force (vector-valued) at the given point by distributing it
+  // to the DoFs of the cell containing the point.
+  template <int dim>
+  void
+  ElastoDynamics<dim>::add_point_force(Vector<double> &     rhs,
+                                       const Point<dim> &   point,
+                                       const Vector<double> &force)
+  {
+    bool applied = false;
+
+    for (const auto &cell : dof_handler.active_cell_iterators())
+      {
+        const Point<dim> unit_cell_point =
+          mapping.transform_real_to_unit_cell(cell, point);
+
+        // Check whether the point lies inside or on the reference cell
+        bool inside = true;
+        for (unsigned int d = 0; d < dim; ++d)
+          if (unit_cell_point[d] < -1.0e-6 ||
+              unit_cell_point[d] > 1.0 + 1.0e-6)
+            inside = false;
+
+        if (!inside)
+          continue;
+
+        std::vector<types::global_dof_index> local_dof_indices(
+          fe.dofs_per_cell);
+        cell->get_dof_indices(local_dof_indices);
+
+        for (unsigned int i = 0; i < fe.dofs_per_cell; ++i)
+          {
+            const unsigned int component_i =
+              fe.system_to_component_index(i).first;
+            const double phi_i = fe.shape_value(i, unit_cell_point);
+
+            if (std::abs(phi_i) > 1.0e-14)
+              rhs(local_dof_indices[i]) += phi_i * force[component_i];
+          }
+
+        applied = true;
+        break;
+      }
+
+    if (!applied)
+      std::cerr << "Propeller point source outside the solid mesh (skipped): "
+                << point << std::endl;
+  }
+
+
+
+  // Apply the propeller loads (one thrust + one torque per hub) as a
+  // Point load (thrust) and a couple (torque) about each hub.
+  template <int dim>
+  void
+  ElastoDynamics<dim>::add_propeller_rhs()
+  {
+    const unsigned int n_prop = adapter.get_n_prop_vertices();
+    if (n_prop == 0 || prop_force_values.empty())
+      return;
+
+    const std::vector<double> &coords = adapter.get_prop_vertices_coords();
+
+    for (unsigned int hub = 0; hub < n_prop; ++hub)
+      {
+        Point<dim> hub_point;
+        for (unsigned int d = 0; d < dim; ++d)
+          hub_point[d] = coords[hub * dim + d];
+
+        Vector<double> thrust(dim);
+        Vector<double> torque(dim);
+        for (unsigned int d = 0; d < dim; ++d)
+          {
+            thrust[d] = prop_force_values[hub * dim + d];
+            torque[d] = prop_torque_values[hub * dim + d];
+          }
+
+        // 1) Point thrust at the hub
+        add_point_force(system_rhs, hub_point, thrust);
+
+        // 2) Torque as a couple: for each local axis t, apply two opposing
+        //    forces +/- 0.5*(torque x t)/h at hub +/- (h/2) t.
+        double h = 0.0;
+        for (const auto &cell : dof_handler.active_cell_iterators())
+          {
+            const Point<dim> uc =
+              mapping.transform_real_to_unit_cell(cell, hub_point);
+            bool inside = true;
+            for (unsigned int d = 0; d < dim; ++d)
+              if (uc[d] < -1.0e-6 || uc[d] > 1.0 + 1.0e-6)
+                inside = false;
+            if (inside)
+              {
+                h = cell->diameter();
+                break;
+              }
+          }
+        if (h <= 0.0)
+          {
+            std::cerr << "Propeller hub outside the solid mesh; torque skipped."
+                      << std::endl;
+            continue;
+          }
+        // Clamp the couple arm so the two couple points stay inside the
+        // (possibly thin) structure. The net moment is independent of h.
+        h = std::min(h, 0.004);
+        const double half = 0.5 * h;
+
+        for (unsigned int axis = 0; axis < dim; ++axis)
+          {
+            Point<dim> axis_dir;
+            axis_dir[axis] = 1.0;
+
+            Vector<double> f(dim);
+            for (unsigned int d = 0; d < dim; ++d)
+              {
+                // 0.5 * (torque x e_axis) / h  (sum over all three axes gives
+                // the full torque, see mechanics of a three-axis couple)
+                f[d] =
+                  0.5 *
+                  (torque[(axis + 1) % dim] * axis_dir[(axis + 2) % dim] -
+                   torque[(axis + 2) % dim] * axis_dir[(axis + 1) % dim]) /
+                  h;
+              }
+
+            Point<dim> p_plus  = hub_point;
+            Point<dim> p_minus = hub_point;
+            p_plus[axis] += half;
+            p_minus[axis] -= half;
+
+            Vector<double> f_neg(dim);
+            for (unsigned int d = 0; d < dim; ++d)
+              f_neg[d] = -f[d];
+
+            add_point_force(system_rhs, p_plus, f);
+            add_point_force(system_rhs, p_minus, f_neg);
+          }
+      }
+  }
+
+
+
+  // Apply the control-surface hinge loads (one force + one moment per hinge)
+  // as a point load (force) and a couple (moment) about each hinge vertex.
+  template <int dim>
+  void
+  ElastoDynamics<dim>::add_hinge_rhs()
+  {
+    const unsigned int n_hinges = adapter.get_n_hinge_vertices();
+    if (n_hinges == 0 || hinge_force_values.empty())
+      return;
+
+    const std::vector<double> &coords = adapter.get_hinge_vertices_coords();
+
+    for (unsigned int h = 0; h < n_hinges; ++h)
+      {
+        Point<dim> hinge_point;
+        for (unsigned int d = 0; d < dim; ++d)
+          hinge_point[d] = coords[h * dim + d];
+
+        Vector<double> force(dim);
+        Vector<double> moment(dim);
+        for (unsigned int d = 0; d < dim; ++d)
+          {
+            force[d]  = hinge_force_values[h * dim + d];
+            moment[d] = hinge_moment_values[h * dim + d];
+          }
+
+        // 1) Point force at the hinge
+        add_point_force(system_rhs, hinge_point, force);
+
+        // 2) Moment as a three-axis couple (same as the propeller torque)
+        double h_arm = 0.0;
+        for (const auto &cell : dof_handler.active_cell_iterators())
+          {
+            const Point<dim> uc =
+              mapping.transform_real_to_unit_cell(cell, hinge_point);
+            bool inside = true;
+            for (unsigned int d = 0; d < dim; ++d)
+              if (uc[d] < -1.0e-6 || uc[d] > 1.0 + 1.0e-6)
+                inside = false;
+            if (inside)
+              {
+                h_arm = cell->diameter();
+                break;
+              }
+          }
+        if (h_arm <= 0.0)
+          {
+            std::cerr << "Hinge outside the solid mesh; moment skipped."
+                      << std::endl;
+            continue;
+          }
+        // Clamp the couple arm so the two couple points stay inside the
+        // (possibly thin) structure. The net moment is independent of h.
+        h_arm = std::min(h_arm, 0.004);
+        const double half = 0.5 * h_arm;
+
+        for (unsigned int axis = 0; axis < dim; ++axis)
+          {
+            Point<dim> axis_dir;
+            axis_dir[axis] = 1.0;
+
+            Vector<double> f(dim);
+            for (unsigned int d = 0; d < dim; ++d)
+              {
+                f[d] =
+                  0.5 *
+                  (moment[(axis + 1) % dim] * axis_dir[(axis + 2) % dim] -
+                   moment[(axis + 2) % dim] * axis_dir[(axis + 1) % dim]) /
+                  h_arm;
+              }
+
+            Point<dim> p_plus  = hinge_point;
+            Point<dim> p_minus = hinge_point;
+            p_plus[axis] += half;
+            p_minus[axis] -= half;
+
+            Vector<double> f_neg(dim);
+            for (unsigned int d = 0; d < dim; ++d)
+              f_neg[d] = -f[d];
+
+            add_point_force(system_rhs, p_plus, f);
+            add_point_force(system_rhs, p_minus, f_neg);
           }
       }
   }
@@ -645,7 +884,25 @@ namespace Linear_Elasticity
     // information to preCICE
     // We aways read data at the end of a time-step, as we blend the beginning
     // and the end via the theta scheme
+    if (parameters.prop_enabled)
+      {
+        adapter.configure_propeller(parameters.prop_mesh_name,
+                                    parameters.prop_force_data_name,
+                                    parameters.prop_torque_data_name);
+        adapter.set_prop_mesh_access_region();
+      }
+    if (parameters.hinge_enabled)
+      {
+        adapter.configure_hinges(parameters.hinge_mesh_name,
+                                 parameters.hinge_force_data_name,
+                                 parameters.hinge_moment_data_name);
+        adapter.set_hinge_mesh_access_region();
+      }
     adapter.initialize(dof_handler, displacement);
+    if (parameters.prop_enabled)
+      adapter.initialize_prop_mesh();
+    if (parameters.hinge_enabled)
+      adapter.initialize_hinge_mesh();
 
     // Then, we start the time loop. The loop itself is steered by preCICE. This
     // line replaces the usual 'while( time < end_time)'
@@ -674,6 +931,18 @@ namespace Linear_Elasticity
                       "."));
 
         adapter.read_data(time.get_delta_t(), stress);
+
+        // Read the propeller loads (thrust + torque) from the fluid
+        if (parameters.prop_enabled)
+          adapter.read_prop_data(time.get_delta_t(),
+                                 prop_force_values,
+                                 prop_torque_values);
+
+        // Read the control-surface hinge loads from the fluid
+        if (parameters.hinge_enabled)
+          adapter.read_hinge_data(time.get_delta_t(),
+                                  hinge_force_values,
+                                  hinge_moment_values);
 
         // Assemble the time dependent contribution obtained from the Fluid
         // participant

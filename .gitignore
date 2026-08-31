@@ -56,3 +56,6 @@ nonlinear_elasticity/nonlinear_elasticity
 
 
 
+
+# Build directories
+build*/

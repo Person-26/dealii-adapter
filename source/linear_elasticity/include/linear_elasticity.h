@@ -22,6 +22,7 @@
 #include <deal.II/grid/tria.h>
 #include <deal.II/grid/tria_accessor.h>
 #include <deal.II/grid/tria_iterator.h>
+#include <deal.II/grid/grid_tools.h>
 
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/lac/dynamic_sparsity_pattern.h>
@@ -84,6 +85,20 @@ namespace Linear_Elasticity
     void
     assemble_consistent_loading();
 
+    // Add the propeller load (point force + couple) to the RHS
+    void
+    add_propeller_rhs();
+
+    // Add the control-surface hinge load (point force + couple) to the RHS
+    void
+    add_hinge_rhs();
+
+    // Add a point force (vector) applied at the given point to the RHS
+    void
+    add_point_force(Vector<double> &rhs,
+                    const Point<dim> &point,
+                    const Vector<double> &force);
+
     // Solve the linear system
     void
     solve();
@@ -132,6 +147,16 @@ namespace Linear_Elasticity
     // Body forces e.g. gravity. Values are specified in the input file
     const bool     body_force_enabled;
     Vector<double> body_force_vector;
+
+    // Propeller loads received from the fluid participant
+    bool             prop_enabled;
+    std::vector<double> prop_force_values;
+    std::vector<double> prop_torque_values;
+
+    // Control-surface hinge loads received from the fluid participant
+    bool                hinge_enabled;
+    std::vector<double> hinge_force_values;
+    std::vector<double> hinge_moment_values;
 
     // In order to measure some timings
     mutable TimerOutput timer;

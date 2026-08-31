@@ -130,6 +130,120 @@ namespace Adapter
                                  Time &                     time_class);
 
     /**
+     * @brief      Enables the optional coupling of actuator-disk propeller
+     *             loads (one thrust force and one reaction torque per hub),
+     *             which are received on a separate preCICE mesh provided by
+     *             the fluid participant.
+     *
+     * @param[in]  prop_mesh_name Name of the received propeller hub mesh
+     *             in the precice-config file.
+     * @param[in]  prop_force_name Name of the (vector) data with the thrust
+     *             per hub on the propeller mesh.
+     * @param[in]  prop_torque_name Name of the (vector) data with the torque
+     *             per hub on the propeller mesh.
+     */
+    void
+    configure_propeller(const std::string &prop_mesh_name,
+                        const std::string &prop_force_name,
+                        const std::string &prop_torque_name);
+
+    /**
+     * @brief Define the access region for the received propeller mesh.
+     *        Must be called before @p initialize() (as preCICE requires the
+     *        geometry access to be defined before the initialization).
+     */
+    void
+    set_prop_mesh_access_region();
+
+    /**
+     * @brief Fetch the received propeller mesh vertices (hub coordinates)
+     *        from preCICE. Must be called after @p initialize().
+     */
+    void
+    initialize_prop_mesh();
+
+    /**
+     * @brief Read the propeller force and torque data (per hub) for the given
+     *        relative read time.
+     *
+     * @param[in]  relative_read_time Time associated to the coupling data
+     *             received from preCICE.
+     * @param[out] prop_force  dim * nProp vector with the thrust per hub.
+     * @param[out] prop_torque dim * nProp vector with the torque per hub.
+     */
+    void
+    read_prop_data(double               relative_read_time,
+                   std::vector<double> &prop_force,
+                   std::vector<double> &prop_torque);
+
+    /**
+     * @brief      Enables the optional coupling of control-surface hinge
+     *             loads (one force and one moment about the hinge per
+     *             surface), received on a separate preCICE mesh provided by
+     *             the fluid participant.
+     *
+     * @param[in]  hinge_mesh_name Name of the received hinge mesh in the
+     *             precice-config file.
+     * @param[in]  hinge_force_name Name of the (vector) data with the hinge
+     *             force per surface.
+     * @param[in]  hinge_moment_name Name of the (vector) data with the hinge
+     *             moment per surface.
+     */
+    void
+    configure_hinges(const std::string &hinge_mesh_name,
+                     const std::string &hinge_force_name,
+                     const std::string &hinge_moment_name);
+
+    /**
+     * @brief Define the access region for the received hinge mesh.
+     *        Must be called before @p initialize().
+     */
+    void
+    set_hinge_mesh_access_region();
+
+    /**
+     * @brief Fetch the received hinge mesh vertices. Must be called after
+     *        @p initialize().
+     */
+    void
+    initialize_hinge_mesh();
+
+    /**
+     * @brief Read the hinge force and moment data (per surface) for the given
+     *        relative read time.
+     */
+    void
+    read_hinge_data(double               relative_read_time,
+                    std::vector<double> &hinge_force,
+                    std::vector<double> &hinge_moment);
+
+    /**
+     * @brief Number of hinge vertices received from preCICE.
+     */
+    unsigned int
+    get_n_hinge_vertices() const;
+
+    /**
+     * @brief Coordinates of the hinge vertices as received from preCICE
+     *        (dim * n_hinges values, interleaved).
+     */
+    const std::vector<double> &
+    get_hinge_vertices_coords() const;
+
+    /**
+     * @brief Number of propeller hubs received from preCICE.
+     */
+    unsigned int
+    get_n_prop_vertices() const;
+
+    /**
+     * @brief Coordinates of the propeller hubs as received from preCICE
+     *        (dim*n_hubs values, interleaved).
+     */
+    const std::vector<double> &
+    get_prop_vertices_coords() const;
+
+    /**
      * @brief public precice Participant
      */
 
@@ -171,6 +285,22 @@ namespace Adapter
     // Container to store time dependent data in case of an implicit coupling
     std::vector<VectorType> old_state_data;
     double                  old_time_value;
+
+    // Optional coupling of actuator-disk propeller loads
+    bool                prop_enabled    = false;
+    std::string         prop_mesh_name;
+    std::string         prop_force_name;
+    std::string         prop_torque_name;
+    std::vector<int>    prop_vertex_ids;
+    std::vector<double> prop_vertex_coords;
+
+    // Optional coupling of control-surface hinge loads
+    bool                hinge_enabled     = false;
+    std::string         hinge_mesh_name;
+    std::string         hinge_force_name;
+    std::string         hinge_moment_name;
+    std::vector<int>    hinge_vertex_ids;
+    std::vector<double> hinge_vertex_coords;
 
     /**
      * @brief format_deal_to_precice Formats a global deal.II vector of type
@@ -486,6 +616,231 @@ namespace Adapter
         // given time value.
         time_class.set_absolute_time(old_time_value);
       }
+  }
+
+
+
+  // ----------------------------------------------------------------------- //
+  // Optional coupling of actuator-disk propeller loads
+  // ----------------------------------------------------------------------- //
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::configure_propeller(
+    const std::string &prop_mesh_name,
+    const std::string &prop_force_name,
+    const std::string &prop_torque_name)
+  {
+    prop_enabled         = true;
+    this->prop_mesh_name = prop_mesh_name;
+    this->prop_force_name  = prop_force_name;
+    this->prop_torque_name = prop_torque_name;
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::set_prop_mesh_access_region()
+  {
+    if (!prop_enabled)
+      return;
+
+    // Define a region of interest covering the whole domain. The hub
+    // vertices of the received propeller mesh are expected there.
+    std::vector<double> bounding_box;
+    const int           prop_dim = precice.getMeshDimensions(prop_mesh_name);
+    if (prop_dim == 2)
+      bounding_box = {-1.0e9, 1.0e9, -1.0e9, 1.0e9};
+    else
+      bounding_box = {-1.0e9, 1.0e9, -1.0e9, 1.0e9, -1.0e9, 1.0e9};
+
+    precice.setMeshAccessRegion(prop_mesh_name, bounding_box);
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::initialize_prop_mesh()
+  {
+    if (!prop_enabled)
+      return;
+
+    const int prop_dim = precice.getMeshDimensions(prop_mesh_name);
+    const int n_props  = precice.getMeshVertexSize(prop_mesh_name);
+
+    AssertThrow(prop_dim == dim,
+                ExcMessage("Propeller mesh dimension mismatch."));
+
+    prop_vertex_ids.resize(n_props);
+    prop_vertex_coords.resize(n_props * prop_dim);
+
+    precice.getMeshVertexIDsAndCoordinates(
+      prop_mesh_name, prop_vertex_ids, prop_vertex_coords);
+
+    std::cout << "\t Number of propeller hubs: " << n_props << std::endl;
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::read_prop_data(
+    double               relative_read_time,
+    std::vector<double> &prop_force,
+    std::vector<double> &prop_torque)
+  {
+    if (!prop_enabled)
+      return;
+
+    const int prop_dim = precice.getMeshDimensions(prop_mesh_name);
+    const int n_prop   = prop_vertex_ids.size();
+
+    prop_force.resize(n_prop * prop_dim);
+    prop_torque.resize(n_prop * prop_dim);
+
+    precice.readData(prop_mesh_name,
+                     prop_force_name,
+                     prop_vertex_ids,
+                     relative_read_time,
+                     prop_force);
+
+    precice.readData(prop_mesh_name,
+                     prop_torque_name,
+                     prop_vertex_ids,
+                     relative_read_time,
+                     prop_torque);
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  unsigned int
+  Adapter<dim, VectorType, ParameterClass>::get_n_prop_vertices() const
+  {
+    return prop_vertex_ids.size();
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  const std::vector<double> &
+  Adapter<dim, VectorType, ParameterClass>::get_prop_vertices_coords() const
+  {
+    return prop_vertex_coords;
+  }
+
+
+
+  // ----------------------------------------------------------------------- //
+  // Optional coupling of control-surface hinge loads
+  // ----------------------------------------------------------------------- //
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::configure_hinges(
+    const std::string &hinge_mesh_name,
+    const std::string &hinge_force_name,
+    const std::string &hinge_moment_name)
+  {
+    hinge_enabled          = true;
+    this->hinge_mesh_name  = hinge_mesh_name;
+    this->hinge_force_name = hinge_force_name;
+    this->hinge_moment_name = hinge_moment_name;
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::set_hinge_mesh_access_region()
+  {
+    if (!hinge_enabled)
+      return;
+
+    std::vector<double> bounding_box;
+    const int           hinge_dim = precice.getMeshDimensions(hinge_mesh_name);
+    if (hinge_dim == 2)
+      bounding_box = {-1.0e9, 1.0e9, -1.0e9, 1.0e9};
+    else
+      bounding_box = {-1.0e9, 1.0e9, -1.0e9, 1.0e9, -1.0e9, 1.0e9};
+
+    precice.setMeshAccessRegion(hinge_mesh_name, bounding_box);
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::initialize_hinge_mesh()
+  {
+    if (!hinge_enabled)
+      return;
+
+    const int hinge_dim = precice.getMeshDimensions(hinge_mesh_name);
+    const int n_hinges  = precice.getMeshVertexSize(hinge_mesh_name);
+
+    AssertThrow(hinge_dim == dim,
+                ExcMessage("Hinge mesh dimension mismatch."));
+
+    hinge_vertex_ids.resize(n_hinges);
+    hinge_vertex_coords.resize(n_hinges * hinge_dim);
+
+    precice.getMeshVertexIDsAndCoordinates(
+      hinge_mesh_name, hinge_vertex_ids, hinge_vertex_coords);
+
+    std::cout << "\t Number of control-surface hinges: " << n_hinges
+              << std::endl;
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::read_hinge_data(
+    double               relative_read_time,
+    std::vector<double> &hinge_force,
+    std::vector<double> &hinge_moment)
+  {
+    if (!hinge_enabled)
+      return;
+
+    const int hinge_dim = precice.getMeshDimensions(hinge_mesh_name);
+    const int n_hinges  = hinge_vertex_ids.size();
+
+    hinge_force.resize(n_hinges * hinge_dim);
+    hinge_moment.resize(n_hinges * hinge_dim);
+
+    precice.readData(hinge_mesh_name,
+                     hinge_force_name,
+                     hinge_vertex_ids,
+                     relative_read_time,
+                     hinge_force);
+
+    precice.readData(hinge_mesh_name,
+                     hinge_moment_name,
+                     hinge_vertex_ids,
+                     relative_read_time,
+                     hinge_moment);
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  unsigned int
+  Adapter<dim, VectorType, ParameterClass>::get_n_hinge_vertices() const
+  {
+    return hinge_vertex_ids.size();
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  const std::vector<double> &
+  Adapter<dim, VectorType, ParameterClass>::get_hinge_vertices_coords() const
+  {
+    return hinge_vertex_coords;
   }
 } // namespace Adapter
 
