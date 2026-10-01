@@ -39,8 +39,19 @@
 #include <adapter/parameters.h>
 #include <adapter/time_handler.h>
 
+// rb::servoStep, the servo model shared with the multiphysics participants
+// (actuators.hpp, found through MP_SHARED_INCLUDE_DIR).
+#include <actuators.hpp>
+
 #include <fstream>
 #include <iostream>
+#include <algorithm>
+#include <limits>
+#include <locale>
+#include <map>
+#include <numeric>
+#include <set>
+#include <sstream>
 
 #include "include/postprocessor.h"
 
@@ -62,6 +73,7 @@ namespace Linear_Elasticity
     , body_force_enabled(parameters.body_force.norm() > 1e-15)
     , prop_enabled(parameters.prop_enabled)
     , hinge_enabled(parameters.hinge_enabled)
+    , servo_enabled(parameters.servo_enabled)
     , timer(std::cout, TimerOutput::summary, TimerOutput::wall_times)
     , time(parameters.end_time, parameters.delta_t)
     , adapter(parameters, interface_boundary_id)
@@ -84,7 +96,7 @@ namespace Linear_Elasticity
   {
     uint n_x, n_y, n_z;
 
-    // Both preconfigured cases consist of a rectangle
+    // All preconfigured cases consist of a rectangular block
     Point<dim> point_bottom;
     Point<dim> point_tip;
 
@@ -109,9 +121,13 @@ namespace Linear_Elasticity
         id_flap_long_top     = 3;
         id_flap_short_bottom = 0; // y direction
         id_flap_short_top    = 1;
+
+        // only relevant for quasi-2D
+        id_flap_out_of_plane_bottom = 4; // z direction
+        id_flap_out_of_plane_top    = 5;
       }
     // PF Case
-    else
+    else if (parameters.scenario == "PF")
       {
         n_x = 3;
         n_y = 18;
@@ -130,11 +146,52 @@ namespace Linear_Elasticity
         id_flap_long_top     = 1;
         id_flap_short_bottom = 2; // y direction
         id_flap_short_top    = 3;
-      }
 
-    // Same for both scenarios, only relevant for quasi-2D
-    id_flap_out_of_plane_bottom = 4; // z direction
-    id_flap_out_of_plane_top    = 5;
+        // only relevant for quasi-2D
+        id_flap_out_of_plane_bottom = 4; // z direction
+        id_flap_out_of_plane_top    = 5;
+      }
+    // Flying-sled foam airframe: the flat plate of the reference example
+    // (test/flying-sled). It runs from the clamped leading edge (x = 0.45)
+    // through the elevon hinge line (x = 0.55) to the elevon trailing edge
+    // (x = 0.62), so the elevons (x in [0.55, 0.62]) are part of the same
+    // structure. In 3D the plate is built by make_sled_grid(); this block is
+    // the 2D fallback.
+    else if (parameters.scenario == "Sled")
+      {
+        if (dim == 3)
+          {
+            make_sled_grid();
+            return;
+          }
+        n_x = 17; // 0.01 m cells, so a cell face lies on the hinge x = 0.55
+        n_y = 12;
+        n_z = 1;
+
+        const double t = parameters.plate_thickness; // foam plate [m]
+
+        point_bottom = dim == 3 ? Point<dim>(0.45, 0.10, -0.5 * t) :
+                                  Point<dim>(0.45, 0.10);
+        point_tip    = dim == 3 ? Point<dim>(0.62, 0.40, 0.5 * t) :
+                                  Point<dim>(0.62, 0.40);
+
+        // colorized boundary IDs: 0 = x-, 1 = x+, 2 = y-, 3 = y+, 4 = z-,
+        // 5 = z+. Couple the upper face (z+) to the fluid and clamp the
+        // leading edge (x-); leave the remaining faces free. There is no
+        // quasi-2D out-of-plane clamp for the sled plate, so those IDs point
+        // at faces that do not exist.
+        id_flap_long_bottom         = 7; // unused
+        id_flap_long_top            = 7; // unused
+        id_flap_short_bottom        = 0; // x- (leading edge) -> clamped
+        id_flap_short_top           = 5; // z+ -> coupling interface
+        id_flap_out_of_plane_bottom = 8; // unused
+        id_flap_out_of_plane_top    = 9; // unused
+      }
+    else
+      {
+        AssertThrow(false,
+                    ExcMessage("Unknown scenario: " + parameters.scenario));
+      }
 
     // Vector of dim values denoting the number of cells to generate in that
     // direction
@@ -157,7 +214,7 @@ namespace Linear_Elasticity
     // the Constructor, since it is needed by the Constructor of the Adapter
     // class.
     clamped_mesh_id              = 0;
-    out_of_plane_clamped_mesh_id = 4;
+    out_of_plane_clamped_mesh_id = id_flap_out_of_plane_bottom;
 
     // The IDs must not be the same:
     std::string error_message(
@@ -191,6 +248,98 @@ namespace Linear_Elasticity
 
 
 
+  // The 3D flying-sled plate. With the servo hinge it is built from three
+  // pieces that share no vertices: the airframe (x in [0.45, 0.55]) and one
+  // flap per elevon (x in [0.55, 0.62], y in [0.10, 0.25] and [0.25, 0.40]).
+  // The flaps are joined to the airframe only by the hinge-line ties in
+  // setup_servo_hinges(), so each elevon can rotate rigidly about the hinge
+  // and the two elevons can deflect differentially. Without the servo it is a
+  // single block with a cell face on the hinge line.
+  //
+  // Material ids: 0 = airframe, 1 + s = flap of surface s. Boundary ids: the
+  // leading edge (x = 0.45) is clamped, the upper face (z+) of the airframe is
+  // the coupling interface (the fluid airframe patch stops at the hinge; the
+  // elevon loads reach the solid through the hinge data), and every other face
+  // is free.
+  template <int dim>
+  void
+  ElastoDynamics<dim>::make_sled_grid()
+  {
+    const double t   = parameters.plate_thickness; // foam plate [m]
+    const double xLE = 0.45, xH = 0.55, xTE = 0.62;
+    const double y0 = 0.10, yM = 0.25, y1 = 0.40;
+
+    const auto block = [t](Triangulation<dim> &tria,
+                           const unsigned int  nx,
+                           const unsigned int  ny,
+                           const double        xa,
+                           const double        xb,
+                           const double        ya,
+                           const double        yb) {
+      GridGenerator::subdivided_hyper_rectangle(
+        tria,
+        std::vector<unsigned int>({nx, ny, 1}),
+        Point<dim>(xa, ya, -0.5 * t),
+        Point<dim>(xb, yb, 0.5 * t));
+    };
+
+    // About 0.024 m chordwise and 0.025 m spanwise cells in every piece, with
+    // a cell face on the hinge line.
+    if (servo_enabled)
+      {
+        Triangulation<dim> airframe, flap_left, flap_right;
+        block(airframe, 4, 12, xLE, xH, y0, y1);
+        block(flap_left, 3, 6, xH, xTE, y0, yM);
+        block(flap_right, 3, 6, xH, xTE, yM, y1);
+        // A zero vertex tolerance keeps the coincident hinge and inter-elevon
+        // vertices separate.
+        GridGenerator::merge_triangulations({&airframe, &flap_left, &flap_right},
+                                            triangulation,
+                                            /*duplicated_vertex_tolerance*/ 0.0);
+        for (const auto &cell : triangulation.active_cell_iterators())
+          cell->set_material_id(cell->center()[0] < xH ?
+                                  0 :
+                                  (cell->center()[1] < yM ? 1 : 2));
+      }
+    else
+      {
+        // One continuous plate: the default tolerance merges the vertices on
+        // the hinge line.
+        Triangulation<dim> airframe, flaps;
+        block(airframe, 4, 12, xLE, xH, y0, y1);
+        block(flaps, 3, 12, xH, xTE, y0, y1);
+        GridGenerator::merge_triangulations(airframe, flaps, triangulation);
+        for (const auto &cell : triangulation.active_cell_iterators())
+          cell->set_material_id(0);
+      }
+
+    clamped_mesh_id              = 0;
+    out_of_plane_clamped_mesh_id = 9; // no face carries it
+    const types::boundary_id free_id = 7;
+    AssertThrow(interface_boundary_id == adapter.deal_boundary_interface_id,
+                ExcMessage("Wrong interface ID in the Adapter specified"));
+    AssertThrow(interface_boundary_id != clamped_mesh_id &&
+                  interface_boundary_id != free_id &&
+                  interface_boundary_id != out_of_plane_clamped_mesh_id,
+                ExcMessage("Conflicting Sled boundary IDs"));
+
+    const double tol = 1.0e-9;
+    for (const auto &cell : triangulation.active_cell_iterators())
+      for (const auto &face : cell->face_iterators())
+        if (face->at_boundary())
+          {
+            const Point<dim> c = face->center();
+            if (std::abs(c[0] - xLE) < tol)
+              face->set_boundary_id(clamped_mesh_id);
+            else if (c[2] > 0.5 * t - tol && c[0] < xH)
+              face->set_boundary_id(interface_boundary_id);
+            else
+              face->set_boundary_id(free_id);
+          }
+  }
+
+
+
   template <int dim>
   void
   ElastoDynamics<dim>::setup_system()
@@ -202,6 +351,8 @@ namespace Linear_Elasticity
                                             hanging_node_constraints);
     hanging_node_constraints.close();
 
+    n_elastic_dofs = dof_handler.n_dofs();
+
     DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
     DoFTools::make_sparsity_pattern(dof_handler,
                                     dsp,
@@ -209,24 +360,36 @@ namespace Linear_Elasticity
                                     /*keep_constrained_dofs = */ true);
     sparsity_pattern.copy_from(dsp);
 
-    // Initialize relevant matrices
+    // Initialize relevant matrices. The mass and stiffness matrices stay of
+    // elastic size; the stepping/system matrices are augmented to
+    // n_elastic_dofs + n_flaps in assemble_system() when servos are enabled.
     mass_matrix.reinit(sparsity_pattern);
     stiffness_matrix.reinit(sparsity_pattern);
-    system_matrix.reinit(sparsity_pattern);
-    stepping_matrix.reinit(sparsity_pattern);
+    if (!servo_enabled)
+      {
+        system_matrix.reinit(sparsity_pattern);
+        stepping_matrix.reinit(sparsity_pattern);
+      }
 
-    // Initialize all vectors
-    old_velocity.reinit(dof_handler.n_dofs());
-    velocity.reinit(dof_handler.n_dofs());
+    // Initialize all vectors. With servos, the time dependent vectors carry
+    // one extra theta entry per surface (one flap per surface, checked in
+    // setup_servo_hinges()) after the elastic dofs.
+    const unsigned int n_aug =
+      servo_enabled
+        ? n_elastic_dofs +
+            parameters.servo_hinge_locations.size() / dim
+        : n_elastic_dofs;
+    old_velocity.reinit(n_aug);
+    velocity.reinit(n_aug);
 
-    old_displacement.reinit(dof_handler.n_dofs());
-    displacement.reinit(dof_handler.n_dofs());
+    old_displacement.reinit(n_aug);
+    displacement.reinit(n_aug);
 
-    system_rhs.reinit(dof_handler.n_dofs());
-    old_stress.reinit(dof_handler.n_dofs());
-    stress.reinit(dof_handler.n_dofs());
+    system_rhs.reinit(n_aug);
+    old_stress.reinit(n_aug);
+    stress.reinit(n_aug);
 
-    body_force_vector.reinit(dof_handler.n_dofs());
+    body_force_vector.reinit(n_aug);
 
     std::cout.imbue(std::locale(""));
     std::cout << "Triangulation:"
@@ -239,6 +402,15 @@ namespace Linear_Elasticity
     // Define alias for time dependent variables as described above
     state_variables = {
       &old_velocity, &velocity, &old_displacement, &displacement, &old_stress};
+    // The servo states are time-dependent too; keep them checkpointed so an
+    // implicit-coupling re-subiteration reloads them together with the
+    // elastic vectors.
+    if (servo_enabled)
+      {
+        state_variables.push_back(&servo_theta);
+        state_variables.push_back(&servo_omega);
+        state_variables.push_back(&servo_cmd);
+      }
 
     // loads at time 0
     // TODO: Check, if initial conditions should be set at the beginning
@@ -347,14 +519,63 @@ namespace Linear_Elasticity
     }
 
     // Then, we save the system_matrix, which is needed every timestep
-    stepping_matrix.copy_from(stiffness_matrix);
+    if (!servo_enabled)
+      {
+        stepping_matrix.copy_from(stiffness_matrix);
+        stepping_matrix *= time.get_delta_t() * time.get_delta_t() *
+                           parameters.theta * parameters.theta;
+        stepping_matrix.add(1, mass_matrix);
+        hanging_node_constraints.condense(stepping_matrix);
+      }
+    else
+      {
+        // Elastic stepping block at elastic size.
+        SparseMatrix<double> stepping_elastic;
+        stepping_elastic.reinit(sparsity_pattern);
+        stepping_elastic.copy_from(stiffness_matrix);
+        stepping_elastic *= time.get_delta_t() * time.get_delta_t() *
+                            parameters.theta * parameters.theta;
+        stepping_elastic.add(1, mass_matrix);
 
-    stepping_matrix *= time.get_delta_t() * time.get_delta_t() *
-                       parameters.theta * parameters.theta;
+        // Augmented N x N pattern: the elastic block plus one theta row per
+        // flap, coupled to its own flap dofs. The gauge/hinge constraints
+        // are condensed into the pattern below, which adds exactly the fill-in
+        // they require (no dense flap block).
+        // DoFTools needs a pattern of exactly n_dofs rows, so build the
+        // elastic block at elastic size and copy it in.
+        const unsigned int     N = n_elastic_dofs + n_flaps;
+        DynamicSparsityPattern dsp_elastic(n_elastic_dofs, n_elastic_dofs);
+        DoFTools::make_sparsity_pattern(dof_handler,
+                                        dsp_elastic,
+                                        servo_constraints,
+                                        /*keep_constrained_dofs = */ true);
+        DynamicSparsityPattern dsp_aug(N, N);
+        for (unsigned int i = 0; i < n_elastic_dofs; ++i)
+          for (auto it = dsp_elastic.begin(i); it != dsp_elastic.end(i); ++it)
+            dsp_aug.add(i, it->column());
+        for (const ServoHinge &sh : servo_hinges)
+          for (auto i : sh.flap_dofs)
+            {
+              dsp_aug.add(sh.dof, i);
+              dsp_aug.add(i, sh.dof);
+            }
+        servo_constraints.condense(dsp_aug);
+        augmented_sparsity_pattern.copy_from(dsp_aug);
+        system_matrix.reinit(augmented_sparsity_pattern);
+        stepping_matrix.reinit(augmented_sparsity_pattern);
 
-    stepping_matrix.add(1, mass_matrix);
-
-    hanging_node_constraints.condense(stepping_matrix);
+        // Copy the elastic block into the augmented matrix and condense the
+        // servo constraints (hinge ties + gauge) before the boundary values
+        // are applied.
+        stepping_matrix = 0.0;
+        for (unsigned int i = 0; i < n_elastic_dofs; ++i)
+          for (SparseMatrix<double>::const_iterator it =
+                 stepping_elastic.begin(i);
+               it != stepping_elastic.end(i);
+               ++it)
+            stepping_matrix.add(i, it->column(), it->value());
+        servo_constraints.condense(stepping_matrix);
+      }
 
     // Calculate contribution of gravity and store them in gravitational_force
     if (body_force_enabled)
@@ -366,12 +587,18 @@ namespace Linear_Elasticity
         // Create a constant function object
         Functions::ConstantFunction<dim> bf_function(bf_vector);
 
-        // Create the contribution to the right-hand side vector
+        // Create the contribution to the right-hand side vector. VectorTools
+        // needs a vector of exactly n_dofs entries; the servo's theta
+        // entries get no body force.
+        Vector<double> bf_rhs(dof_handler.n_dofs());
         VectorTools::create_right_hand_side(mapping,
                                             dof_handler,
                                             QGauss<dim>(quad_order),
                                             bf_function,
-                                            body_force_vector);
+                                            bf_rhs);
+        body_force_vector = 0.0;
+        for (unsigned int i = 0; i < bf_rhs.size(); ++i)
+          body_force_vector[i] = bf_rhs[i];
       }
   }
 
@@ -410,7 +637,34 @@ namespace Linear_Elasticity
 
     // tmp vector to store intermediate results
     Vector<double> tmp;
-    tmp.reinit(dof_handler.n_dofs());
+    tmp.reinit(servo_enabled ? n_elastic_dofs + n_flaps :
+                               dof_handler.n_dofs());
+
+    // The mass/stiffness matrices are of elastic size, so in the servo case
+    // apply them only to the elastic part of the augmented vectors.
+    Vector<double> src_n, dst_n;
+    if (servo_enabled)
+      {
+        src_n.reinit(n_elastic_dofs);
+        dst_n.reinit(n_elastic_dofs);
+      }
+    const auto elastic_vmult = [this, &src_n, &dst_n](
+                                 const SparseMatrix<double> &M,
+                                 Vector<double> &            dst,
+                                 const Vector<double> &      src) {
+      if (!servo_enabled)
+        {
+          M.vmult(dst, src);
+          return;
+        }
+      for (unsigned int i = 0; i < n_elastic_dofs; ++i)
+        src_n[i] = src[i];
+      M.vmult(dst_n, src_n);
+      for (unsigned int i = 0; i < n_elastic_dofs; ++i)
+        dst[i] = dst_n[i];
+      for (unsigned int i = n_elastic_dofs; i < dst.size(); ++i)
+        dst[i] = 0.0;
+    };
 
     tmp = system_rhs;
 
@@ -418,18 +672,28 @@ namespace Linear_Elasticity
     system_rhs.add(time.get_delta_t() * (1 - parameters.theta), old_stress);
     old_stress = tmp;
 
-    mass_matrix.vmult(tmp, old_velocity);
+    elastic_vmult(mass_matrix, tmp, old_velocity);
     system_rhs.add(1, tmp);
 
-    stiffness_matrix.vmult(tmp, old_velocity);
+    elastic_vmult(stiffness_matrix, tmp, old_velocity);
     system_rhs.add(-parameters.theta * time.get_delta_t() * time.get_delta_t() *
                      (1 - parameters.theta),
                    tmp);
 
-    stiffness_matrix.vmult(tmp, old_displacement);
+    elastic_vmult(stiffness_matrix, tmp, old_displacement);
     system_rhs.add(-time.get_delta_t(), tmp);
 
-    hanging_node_constraints.condense(system_rhs);
+    if (servo_enabled)
+      servo_constraints.condense(system_rhs);
+    else
+      hanging_node_constraints.condense(system_rhs);
+
+    // Theta rows of the RHS: I_ss * omega keeps the solved theta velocity
+    // consistent with the explicit servo state (overwritten by
+    // update_servo_hinges() after the solve anyway).
+    if (servo_enabled)
+      for (unsigned int s = 0; s < n_flaps; ++s)
+        system_rhs(servo_hinges[s].dof) = servo_inertia_row[s] * servo_omega[s];
 
     // Copy the system_matrix every timestep, since applying the BC deletes
     // certain rows and columns
@@ -464,6 +728,387 @@ namespace Linear_Elasticity
   }
 
 
+
+  // ---------------------------------------------------------------------
+  // Actuated control-surface hinge (rotational DOF + servo)
+  // ---------------------------------------------------------------------
+  //
+  // The control surface is part of the same elastic plate as the airframe. The
+  // mesh is split at the hinge into an airframe block and a flap block whose
+  // hinge-line nodes are duplicated. The flap keeps its elastic bending; its
+  // rigid rotation about the hinge is carried by one extra scalar DOF `theta`,
+  // driven by the servo model. The flap hinge nodes are tied to the airframe,
+  // and a mass-orthogonal gauge (g^T M_flap u_el = 0) removes the flap's own
+  // rigid rotation from the elastic DOFs, so the system stays SPD and the
+  // existing Direct solver works unchanged.
+
+  namespace
+  {
+    // g(x) = axis x (x - hinge), the rigid-rotation displacement field of the
+    // flap about the hinge line.
+    template <int dim>
+    inline Point<dim>
+    hinge_g(const Point<dim> &axis, const Point<dim> &r)
+    {
+      Point<dim> g;
+      if (dim == 3)
+        g = Point<dim>(axis[1] * r[2] - axis[2] * r[1],
+                       axis[2] * r[0] - axis[0] * r[2],
+                       axis[0] * r[1] - axis[1] * r[0]);
+      else
+        g = Point<dim>(-axis[1] * r[1], axis[0] * r[0]);
+      return g;
+    }
+  } // namespace
+
+  template <int dim>
+  void
+  ElastoDynamics<dim>::setup_servo_hinges()
+  {
+    if (!servo_enabled)
+      return;
+
+    AssertThrow(dim == 3 && parameters.scenario == "Sled",
+                ExcMessage("The servo hinge needs the 3D Sled plate, which "
+                           "builds one mesh piece per flap."));
+
+    n_elastic_dofs = dof_handler.n_dofs();
+    const unsigned int n_surf =
+      parameters.servo_hinge_locations.size() / dim;
+    AssertThrow(parameters.servo_hinge_locations.size() % dim == 0 && n_surf > 0,
+                ExcMessage("Servo hinge locations must be a whole number of "
+                           "dim-tuples."));
+
+    Point<dim> axis;
+    for (unsigned int d = 0; d < dim; ++d)
+      axis[d] = parameters.hinge_axis[d];
+    AssertThrow(axis.norm() > 1e-12, ExcMessage("Hinge axis must be nonzero."));
+    axis /= axis.norm();
+
+    std::map<types::global_dof_index, Point<dim>> support_points;
+    DoFTools::map_dofs_to_support_points(mapping, dof_handler, support_points);
+    // Component of each global dof, built from cell-local lookups
+    // (system_to_component_index() only accepts cell-local indices).
+    std::map<types::global_dof_index, unsigned int> dof_component;
+    {
+      std::vector<types::global_dof_index> local_dofs(fe.dofs_per_cell);
+      for (const auto &cell : dof_handler.active_cell_iterators())
+        {
+          cell->get_dof_indices(local_dofs);
+          for (unsigned int i = 0; i < fe.dofs_per_cell; ++i)
+            dof_component[local_dofs[i]] =
+              fe.system_to_component_index(i).first;
+        }
+    }
+    const auto comp = [&dof_component](const types::global_dof_index i) {
+      return dof_component.at(i);
+    };
+
+    // Surface chord direction: in the plate plane (perpendicular to the plate
+    // normal z) and perpendicular to the hinge axis. For the flat-plate sled
+    // (axis = +y) this gives +x.
+    Point<dim> normal;
+    normal[dim - 1] = 1.0;
+    Point<dim> chord;
+    if (dim == 3)
+      chord = Point<dim>(axis[1] * normal[2] - axis[2] * normal[1],
+                         axis[2] * normal[0] - axis[0] * normal[2],
+                         axis[0] * normal[1] - axis[1] * normal[0]);
+    else
+      {
+        chord[0] = -axis[1];
+        chord[1] = axis[0];
+      }
+    AssertThrow(chord.norm() > 1e-12,
+                ExcMessage("Could not determine the surface chord."));
+    chord /= chord.norm();
+
+    // The flap pieces (material id > 0, see make_sled_grid()) and their span
+    // along the hinge axis. Each control surface actuates exactly one of
+    // them: the one whose span contains its hinge point.
+    std::map<types::material_id, std::pair<double, double>> flap_span;
+    for (const auto &cell : dof_handler.active_cell_iterators())
+      if (cell->material_id() != 0)
+        {
+          auto it = flap_span
+                      .emplace(cell->material_id(),
+                               std::make_pair(std::numeric_limits<double>::max(),
+                                              -std::numeric_limits<double>::max()))
+                      .first;
+          for (const unsigned int v : cell->vertex_indices())
+            {
+              const double a = cell->vertex(v) * axis;
+              it->second.first  = std::min(it->second.first, a);
+              it->second.second = std::max(it->second.second, a);
+            }
+        }
+    AssertThrow(flap_span.size() == n_surf,
+                ExcMessage("Servo hinge locations: expected one hinge per flap (" +
+                           std::to_string(flap_span.size()) + "), got " +
+                           std::to_string(n_surf) + "."));
+
+    servo_command_values.assign(n_surf, 0.0);
+    servo_hinge_moment_axis.assign(n_surf, 0.0);
+    servo_constraints.clear();
+    servo_constraints.merge(hanging_node_constraints);
+
+    // Airframe dofs (the tie targets).
+    std::set<types::global_dof_index> air_dofs;
+    {
+      std::vector<types::global_dof_index> ld(fe.dofs_per_cell);
+      for (const auto &cell : dof_handler.active_cell_iterators())
+        if (cell->material_id() == 0)
+          {
+            cell->get_dof_indices(ld);
+            air_dofs.insert(ld.begin(), ld.end());
+          }
+    }
+
+    std::set<types::material_id>      used_flaps;
+    std::set<types::global_dof_index> all_flap_dofs;
+    servo_hinges.assign(n_surf, ServoHinge());
+    for (unsigned int s = 0; s < n_surf; ++s)
+      {
+        ServoHinge &sh = servo_hinges[s];
+        for (unsigned int d = 0; d < dim; ++d)
+          sh.hinge_point[d] = parameters.servo_hinge_locations[s * dim + d];
+        sh.axis = axis;
+        sh.dof  = n_elastic_dofs + s;
+
+        const double a_h     = sh.hinge_point * axis;
+        types::material_id m = numbers::invalid_material_id;
+        for (const auto &e : flap_span)
+          if (a_h > e.second.first + 1.0e-9 && a_h < e.second.second - 1.0e-9)
+            m = e.first;
+        AssertThrow(m != numbers::invalid_material_id,
+                    ExcMessage("Servo hinge location " + std::to_string(s) +
+                               " is not within the span of any flap."));
+        AssertThrow(used_flaps.insert(m).second,
+                    ExcMessage("Two servo hinge locations lie on the same "
+                               "flap; give one per flap."));
+
+        std::set<types::global_dof_index> flap_dofs;
+        {
+          std::vector<types::global_dof_index> ld(fe.dofs_per_cell);
+          for (const auto &cell : dof_handler.active_cell_iterators())
+            if (cell->material_id() == m)
+              {
+                cell->get_dof_indices(ld);
+                flap_dofs.insert(ld.begin(), ld.end());
+              }
+        }
+        // The flap must be a separate mesh piece: sharing a vertex with the
+        // airframe or the other flap would couple its rigid rotation to them.
+        for (auto i : flap_dofs)
+          AssertThrow(air_dofs.count(i) == 0 && all_flap_dofs.insert(i).second,
+                      ExcMessage("Servo flap " + std::to_string(s) +
+                                 " shares dofs with the airframe or another "
+                                 "flap; the mesh pieces were merged."));
+
+        // Coupling vector and rotary inertia of the flap about the hinge:
+        //   g(x) = axis x (x - hinge)
+        //   cg[j] = int rho phi_j . g dV,  I = int rho g.g dV
+        const QGauss<dim> quad(quad_order);
+        FEValues<dim>     fe_values(mapping,
+                                fe,
+                                quad,
+                                update_values | update_quadrature_points |
+                                  update_JxW_values);
+        std::vector<types::global_dof_index> ld(fe.dofs_per_cell);
+        for (const auto &cell : dof_handler.active_cell_iterators())
+          {
+            if (cell->material_id() != m)
+              continue;
+            fe_values.reinit(cell);
+            cell->get_dof_indices(ld);
+            for (unsigned int q = 0; q < quad.size(); ++q)
+              {
+                const Point<dim> &X = fe_values.quadrature_point(q);
+                const double      w = fe_values.JxW(q);
+                Point<dim>        r;
+                r = X;
+                r -= sh.hinge_point;
+                const Point<dim> g = hinge_g<dim>(axis, r);
+                sh.inertia += parameters.rho * (g * g) * w;
+                for (unsigned int i = 0; i < fe.dofs_per_cell; ++i)
+                  sh.cg[ld[i]] += parameters.rho * fe_values.shape_value(i, q) *
+                                  g[comp(ld[i])] * w;
+              }
+          }
+
+        // Hinge tie: tie each flap node on the hinge line to the co-located
+        // airframe dof of the same component. The flap is a separate mesh
+        // piece, so these are its only connection to the airframe; the flap
+        // can then rotate rigidly about the hinge line (the theta mode, which
+        // the gauge below removes from the elastic dofs).
+        unsigned int n_ties = 0;
+        for (auto f : flap_dofs)
+          {
+            const Point<dim>  X = support_points[f];
+            Point<dim>        r = X;
+            r -= sh.hinge_point;
+            const Tensor<1, dim> proj = r - (r * sh.axis) * sh.axis;
+            if (proj.norm() > 1.0e-6)
+              continue;
+            for (auto a : air_dofs)
+              if (comp(a) == comp(f) &&
+                  (support_points[a] - X).norm() < 1.0e-6)
+                {
+                  servo_constraints.add_line(f);
+                  servo_constraints.add_entry(f, a, 1.0);
+                  ++n_ties;
+                  break;
+                }
+          }
+        AssertThrow(n_ties > 0,
+                    ExcMessage("Servo hinge " + std::to_string(s) +
+                               ": no flap node lies on the hinge line. The "
+                               "hinge point must lie on the flap's hinge edge "
+                               "(for the Sled plate x = 0.55, z = 0)."));
+
+        // Gauge: g^T M_flap u_el = 0 removes the flap's rigid rotation from
+        // the elastic dofs. Pick the flap dof with the largest |cg[j]| as
+        // slave and eliminate it.
+        types::global_dof_index slave = numbers::invalid_dof_index;
+        double                  cgmax = 0.0;
+        for (const auto &e : sh.cg)
+          if (!servo_constraints.is_constrained(e.first) &&
+              std::abs(e.second) > cgmax)
+            {
+              cgmax = std::abs(e.second);
+              slave = e.first;
+            }
+        AssertThrow(slave != numbers::invalid_dof_index,
+                    ExcMessage("Could not select a gauge slave dof for servo "
+                               "hinge " +
+                               std::to_string(s)));
+        servo_constraints.add_line(slave);
+        for (const auto &e : sh.cg)
+          if (e.first != slave)
+            servo_constraints.add_entry(slave, e.first,
+                                        -e.second / sh.cg[slave]);
+
+        for (auto i : flap_dofs)
+          {
+            sh.flap_dofs.push_back(i);
+            sh.flap_points.push_back(support_points[i]);
+            sh.flap_components.push_back(dof_component.at(i));
+          }
+      }
+    n_flaps = n_surf;
+    servo_theta.reinit(n_flaps);
+    servo_omega.reinit(n_flaps);
+    servo_cmd.reinit(n_flaps);
+    servo_constraints.close();
+
+    // setup_system() sized the time-dependent vectors for one theta per
+    // surface; with one flap per surface that is one theta per flap.
+    AssertThrow(displacement.size() == n_elastic_dofs + n_flaps &&
+                  system_rhs.size() == n_elastic_dofs + n_flaps,
+                ExcMessage("Servo: augmented vector size mismatch."));
+  }
+
+
+
+  template <int dim>
+  void
+  ElastoDynamics<dim>::add_servo_terms()
+  {
+    if (!servo_enabled)
+      return;
+
+    // The theta row carries the flap + reflected servo inertia, so the solve
+    // reproduces the explicit servo rate (see assemble_rhs()).
+    servo_inertia_row.assign(n_flaps, 0.0);
+    for (unsigned int s = 0; s < n_flaps; ++s)
+      {
+        const ServoHinge &sh = servo_hinges[s];
+        servo_inertia_row[s] = sh.inertia + parameters.servo_inertia;
+        stepping_matrix.add(sh.dof, sh.dof, servo_inertia_row[s]);
+      }
+  }
+
+
+
+  template <int dim>
+  void
+  ElastoDynamics<dim>::update_servo_hinges()
+  {
+    if (!servo_enabled)
+      return;
+
+    const double dt = time.get_delta_t();
+
+    for (unsigned int s = 0; s < n_flaps; ++s)
+      {
+        const ServoHinge &sh = servo_hinges[s];
+
+        // Reload the servo state from the checkpointed vectors. For an implicit
+        // coupling this reverts theta/omega/cmd to the start of the window
+        // before the step is repeated.
+        rb::ServoModel servo;
+        servo.kp        = parameters.servo_kp;
+        servo.kd        = parameters.servo_kd;
+        servo.torqueMax = parameters.servo_torque_max;
+        servo.rateMax   = parameters.servo_rate_max;
+        servo.freeplay  = parameters.servo_freeplay;
+        servo.coulomb   = parameters.servo_coulomb;
+        servo.viscous   = parameters.servo_viscous;
+        servo.inertia   = sh.inertia + parameters.servo_inertia;
+        servo.theta     = servo_theta[s];
+        servo.omega     = servo_omega[s];
+        servo.cmd       = servo_cmd[s];
+
+        const double theta_before = servo.theta;
+
+        rb::servoStep(servo,
+                      s < servo_command_values.size() ?
+                        servo_command_values[s] :
+                        0.0,
+                      s < servo_hinge_moment_axis.size() ?
+                        servo_hinge_moment_axis[s] :
+                        0.0,
+                      dt);
+
+        const double theta = servo.theta;
+        const double omega = servo.omega;
+        const double cmd   = servo.cmd;
+
+        // Write the rigid rotation theta back into the elastic displacement of
+        // the flap. displacement[j] already carries u_el (bending only, the
+        // gauge keeps the rigid mode out of the elastic solution); adding the
+        // delta keeps the total = u_el + theta*g without double counting.
+        const double dtheta = theta - theta_before;
+        for (std::size_t k = 0; k < sh.flap_dofs.size(); ++k)
+          {
+            const types::global_dof_index j = sh.flap_dofs[k];
+            Point<dim>                    r = sh.flap_points[k];
+            r -= sh.hinge_point;
+            const Point<dim> g = hinge_g<dim>(sh.axis, r);
+            displacement[j] += dtheta * g[sh.flap_components[k]];
+          }
+        displacement[sh.dof] = theta;
+        velocity[sh.dof]     = omega;
+
+        // Publish the advanced state back into the checkpointed vectors.
+        servo_theta[s] = theta;
+        servo_omega[s] = omega;
+        servo_cmd[s]   = cmd;
+
+        // Machine-parseable servo state, one line per surface per time step
+        // (consumed by tests/servo_fem_smoke.py).
+        // std::cout carries the user's locale; format this line in the
+        // classic one so a decimal comma never reaches the parser.
+        std::ostringstream servo_line;
+        servo_line.copyfmt(std::cout);
+        servo_line.imbue(std::locale::classic());
+        servo_line << "SERVO s=" << s << " theta=" << theta
+                   << " omega=" << omega;
+        std::cout << servo_line.str() << std::endl;
+      }
+  }
+
+
   // Process RHS assembly, which is the coupling data (stress) in this case
   template <int dim>
   void
@@ -481,6 +1126,18 @@ namespace Linear_Elasticity
 
     const unsigned int dofs_per_cell   = fe.dofs_per_cell;
     const unsigned int n_face_q_points = face_quadrature_formula.size();
+
+    // FEFaceValues needs a vector of exactly n_dofs entries; with the servo
+    // the stress vector also carries the theta entries, so use its elastic
+    // part.
+    Vector<double> stress_elastic;
+    if (servo_enabled)
+      {
+        stress_elastic.reinit(dof_handler.n_dofs());
+        for (unsigned int i = 0; i < stress_elastic.size(); ++i)
+          stress_elastic[i] = stress[i];
+      }
+    const Vector<double> &stress_field = servo_enabled ? stress_elastic : stress;
 
     Vector<double>                       cell_rhs(dofs_per_cell);
     std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
@@ -506,7 +1163,7 @@ namespace Linear_Elasticity
               // In contrast to the nonlinear solver, no pull back is performed.
               // The equilibrium is stated in reference configuration, but only
               // valid for very small deformations
-              fe_face_values.get_function_values(stress, local_stress);
+              fe_face_values.get_function_values(stress_field, local_stress);
 
               for (unsigned int f_q_point = 0; f_q_point < n_face_q_points;
                    ++f_q_point)
@@ -699,6 +1356,17 @@ namespace Linear_Elasticity
             moment[d] = hinge_moment_values[h * dim + d];
           }
 
+        // With the servo hinge the moment about the hinge axis turns theta
+        // (update_servo_hinges()), so applying it here as well would count it
+        // twice. The hinge force goes into the structure at the solid-frame
+        // hinge point, on the hinge line that ties the flap to the airframe.
+        if (servo_enabled)
+          {
+            if (h < servo_hinges.size())
+              add_point_force(system_rhs, servo_hinges[h].hinge_point, force);
+            continue;
+          }
+
         // 1) Point force at the hinge
         add_point_force(system_rhs, hinge_point, force);
 
@@ -771,8 +1439,9 @@ namespace Linear_Elasticity
     double lin_res = 0.0;
 
     // Solve the linear system either using an iterative CG solver with SSOR or
-    // a direct solver using UMFPACK
-    if (parameters.type_lin == "CG")
+    // a direct solver using UMFPACK. With servos the gauge-coupled system is
+    // solved directly.
+    if (parameters.type_lin == "CG" && !servo_enabled)
       {
         std::cout << "\t CG solver: " << std::endl;
 
@@ -808,7 +1477,10 @@ namespace Linear_Elasticity
     Assert(velocity.linfty_norm() < 1e4, ExcMessage("Linear system diverged"));
     std::cout << "\t     No of iterations:\t" << lin_it
               << "\n \t     Final residual:\t" << lin_res << std::endl;
-    hanging_node_constraints.distribute(velocity);
+    if (servo_enabled)
+      servo_constraints.distribute(velocity);
+    else
+      hanging_node_constraints.distribute(velocity);
 
     timer.leave_subsection("Solve system");
   }
@@ -831,7 +1503,23 @@ namespace Linear_Elasticity
   ElastoDynamics<dim>::output_results() const
   {
     timer.enter_subsection("Output results");
-    DataOut<dim> data_out;
+
+    // The augmented vectors carry theta entries beyond the elastic dofs;
+    // output needs the elastic part only.
+    Vector<double> displacement_out;
+    if (servo_enabled)
+      {
+        displacement_out.reinit(n_elastic_dofs);
+        for (unsigned int i = 0; i < n_elastic_dofs; ++i)
+          displacement_out[i] = displacement[i];
+      }
+    else
+      displacement_out = displacement;
+
+    // Declared before data_out, which keeps pointers to both, so that
+    // data_out is destroyed first.
+    Postprocessor<dim> postprocessor;
+    DataOut<dim>       data_out;
 
     // Note: There is at least paraView v 5.5 needed to visualize this output
     DataOutBase::VtkFlags flags;
@@ -842,13 +1530,12 @@ namespace Linear_Elasticity
 
     // The postprocessor class computes straines and passes the displacement to
     // the output
-    Postprocessor<dim> postprocessor;
-    data_out.add_data_vector(displacement, postprocessor);
+    data_out.add_data_vector(displacement_out, postprocessor);
 
     // visualize the displacements on a displaced grid
     MappingQEulerian<dim> q_mapping(parameters.poly_degree,
                                     dof_handler,
-                                    displacement);
+                                    displacement_out);
     data_out.build_patches(q_mapping,
                            parameters.poly_degree,
                            DataOut<dim>::curved_boundary);
@@ -877,8 +1564,14 @@ namespace Linear_Elasticity
     // In the beginning, we create the mesh and set up the data structures
     make_grid();
     setup_system();
+    // The servo hinge machinery needs the distributed dofs; it must be in
+    // place before the stepping matrix is assembled and condensed.
+    if (servo_enabled)
+      setup_servo_hinges();
     output_results();
     assemble_system();
+    if (servo_enabled)
+      add_servo_terms();
 
     // Then, we initialize preCICE i.e. we pass our mesh and coupling
     // information to preCICE
@@ -891,18 +1584,60 @@ namespace Linear_Elasticity
                                     parameters.prop_torque_data_name);
         adapter.set_prop_mesh_access_region();
       }
-    if (parameters.hinge_enabled)
+    if (parameters.hinge_enabled || servo_enabled)
       {
         adapter.configure_hinges(parameters.hinge_mesh_name,
                                  parameters.hinge_force_data_name,
                                  parameters.hinge_moment_data_name);
         adapter.set_hinge_mesh_access_region();
       }
+    if (servo_enabled)
+      {
+        adapter.configure_servo_command(parameters.servo_command_data_name);
+        adapter.configure_servo_angle(parameters.servo_angle_data_name);
+      }
     adapter.initialize(dof_handler, displacement);
     if (parameters.prop_enabled)
       adapter.initialize_prop_mesh();
-    if (parameters.hinge_enabled)
+    if (parameters.hinge_enabled || servo_enabled)
       adapter.initialize_hinge_mesh();
+    // The hinge mesh vertices are matched to the servo hinges by index. The
+    // fluid-side hinge points need not coincide with the solid-frame ones,
+    // but both must list the surfaces in the same spanwise order.
+    if (servo_enabled)
+      {
+        AssertThrow(adapter.get_n_hinge_vertices() == servo_hinges.size(),
+                    ExcMessage("The hinge mesh must carry one vertex per servo "
+                               "hinge, in the order of \"Servo hinge "
+                               "locations\"."));
+        const std::vector<double> &coords = adapter.get_hinge_vertices_coords();
+        const auto span_order = [this](const auto &span_of) {
+          std::vector<unsigned int> order(servo_hinges.size());
+          std::iota(order.begin(), order.end(), 0u);
+          std::sort(order.begin(),
+                    order.end(),
+                    [&span_of](unsigned int a, unsigned int b) {
+                      return span_of(a) < span_of(b);
+                    });
+          for (std::size_t k = 1; k < order.size(); ++k)
+            AssertThrow(span_of(order[k]) - span_of(order[k - 1]) > 1.0e-9,
+                        ExcMessage("Two servo hinges share a spanwise "
+                                   "position; their order is ambiguous."));
+          return order;
+        };
+        const auto received = span_order([&](unsigned int s) {
+          double a = 0.0;
+          for (unsigned int d = 0; d < dim; ++d)
+            a += coords[s * dim + d] * servo_hinges[s].axis[d];
+          return a;
+        });
+        const auto own = span_order([this](unsigned int s) {
+          return servo_hinges[s].hinge_point * servo_hinges[s].axis;
+        });
+        AssertThrow(received == own,
+                    ExcMessage("The hinge mesh vertices are not in the "
+                               "spanwise order of \"Servo hinge locations\"."));
+      }
 
     // Then, we start the time loop. The loop itself is steered by preCICE. This
     // line replaces the usual 'while( time < end_time)'
@@ -939,10 +1674,30 @@ namespace Linear_Elasticity
                                  prop_torque_values);
 
         // Read the control-surface hinge loads from the fluid
-        if (parameters.hinge_enabled)
+        if (parameters.hinge_enabled || servo_enabled)
           adapter.read_hinge_data(time.get_delta_t(),
                                   hinge_force_values,
                                   hinge_moment_values);
+
+        // Read the servo command and project the aero hinge moment onto the
+        // hinge axis of each surface
+        if (servo_enabled)
+          {
+            adapter.read_servo_command(time.get_delta_t(),
+                                       servo_command_values);
+            for (std::size_t s = 0; s < servo_hinges.size(); ++s)
+              {
+                double m_axis = 0.0;
+                if ((s + 1) * dim <= hinge_moment_values.size())
+                  {
+                    Point<dim> m;
+                    for (unsigned int d = 0; d < dim; ++d)
+                      m[d] = hinge_moment_values[s * dim + d];
+                    m_axis = m * servo_hinges[s].axis;
+                  }
+                servo_hinge_moment_axis[s] = m_axis;
+              }
+          }
 
         // Assemble the time dependent contribution obtained from the Fluid
         // participant
@@ -954,6 +1709,11 @@ namespace Linear_Elasticity
         // Update time dependent data according to the theta-scheme
         update_displacement();
 
+        // Advance the servos explicitly and write the rigid flap rotation back
+        // into the displacement before it is handed to the fluid
+        if (servo_enabled)
+          update_servo_hinges();
+
         // Then, we exchange data with other participants. Most of the work is
         // done in the adapter: We just need to pass both data vectors with
         // coupling data to the adapter. In case of FSI, 'displacement' is the
@@ -962,6 +1722,13 @@ namespace Linear_Elasticity
         // Depending on the coupling scheme, we need to wait here for other
         // participant to finish their time step. Therefore, we measure the
         // timings around this functionality
+        // Hand the angle the servo actually reached back to the fluid
+        if (servo_enabled)
+          {
+            std::vector<double> angle(servo_theta.begin(), servo_theta.end());
+            adapter.write_servo_angle(angle);
+          }
+
         timer.enter_subsection("Advance adapter");
         adapter.advance(displacement, time.get_delta_t());
         timer.leave_subsection("Advance adapter");

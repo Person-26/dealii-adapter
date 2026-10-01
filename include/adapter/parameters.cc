@@ -135,8 +135,14 @@ namespace Parameters
     {
       prm.add_parameter("Scenario",
                         scenario,
-                        "Cases: FSI3 or PF for perpendicular flap",
-                        Patterns::Selection("FSI3|PF"));
+                        "Cases: FSI3, PF for perpendicular flap, or Sled for the "
+                        "flying-sled foam airframe plate",
+                        Patterns::Selection("FSI3|PF|Sled"));
+
+      prm.add_parameter("Plate thickness",
+                        plate_thickness,
+                        "Thickness of the Sled foam plate [m]",
+                        Patterns::Double(0));
 
       prm.add_parameter("precice config-file",
                         config_file,
@@ -211,6 +217,80 @@ namespace Parameters
                         hinge_moment_data_name,
                         "Name of the hinge moment data",
                         Patterns::Anything());
+
+      // Actuated control-surface hinge (rotational DOF driven by a servo). The
+      // servo model is the one shared with the mock fluid (see actuators.hpp):
+      // a saturated PD position loop with a slew rate, freeplay, friction and
+      // the surface's own rotary inertia.
+      prm.add_parameter("Enable servo hinge",
+                        servo_enabled,
+                        "Drive the control surfaces with a rotational servo DOF",
+                        Patterns::Bool());
+
+      prm.add_parameter("Servo command data name",
+                        servo_command_data_name,
+                        "Name of the received servo command (angle)",
+                        Patterns::Anything());
+
+      prm.add_parameter("Servo angle data name",
+                        servo_angle_data_name,
+                        "Name of the written servo angle (the actual surface "
+                        "angle, one scalar per hinge on the hinge mesh); "
+                        "empty to not write it",
+                        Patterns::Anything());
+
+      prm.add_parameter("Hinge axis",
+                        hinge_axis,
+                        "Hinge line direction in the solid frame; the surface "
+                        "rotates about its own axis (3 components; the "
+                        "servo hinge is 3D only)",
+                        Patterns::List(Patterns::Double(), 3, 3));
+
+      prm.add_parameter("Servo hinge locations",
+                        servo_hinge_locations,
+                        "One hinge point per control surface, in the solid "
+                        "frame, as a flat list of dim-tuples",
+                        Patterns::List(Patterns::Double()));
+
+      prm.add_parameter("Servo stiffness",
+                        servo_kp,
+                        "Position-loop stiffness [N m / rad]",
+                        Patterns::Double(0));
+
+      prm.add_parameter("Servo damping",
+                        servo_kd,
+                        "Position-loop damping [N m s / rad]",
+                        Patterns::Double(0));
+
+      prm.add_parameter("Servo stall torque",
+                        servo_torque_max,
+                        "Maximum actuator torque [N m]",
+                        Patterns::Double(0));
+
+      prm.add_parameter("Servo rate",
+                        servo_rate_max,
+                        "Maximum commanded slew rate [rad/s]",
+                        Patterns::Double(0));
+
+      prm.add_parameter("Servo freeplay",
+                        servo_freeplay,
+                        "Linkage backlash half-width [rad]",
+                        Patterns::Double(0));
+
+      prm.add_parameter("Servo friction",
+                        servo_coulomb,
+                        "Coulomb friction torque [N m]",
+                        Patterns::Double(0));
+
+      prm.add_parameter("Servo viscous friction",
+                        servo_viscous,
+                        "Viscous friction [N m s / rad]",
+                        Patterns::Double(0));
+
+      prm.add_parameter("Servo inertia",
+                        servo_inertia,
+                        "Reflected servo/flap rotary inertia [kg m^2]",
+                        Patterns::Double(0));
     }
     prm.leave_subsection();
   }

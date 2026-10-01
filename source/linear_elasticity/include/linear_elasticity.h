@@ -69,6 +69,10 @@ namespace Linear_Elasticity
     void
     make_grid();
 
+    // Build the 3D flying-sled plate (split at the hinge when servo-driven)
+    void
+    make_sled_grid();
+
     // Set up the FE system and allocate data structures
     void
     setup_system();
@@ -92,6 +96,23 @@ namespace Linear_Elasticity
     // Add the control-surface hinge load (point force + couple) to the RHS
     void
     add_hinge_rhs();
+
+    // Build the actuated control-surface hinge: one rotational DOF per surface,
+    // the flap hinge nodes tied to the airframe, a mass-orthogonal gauge that
+    // removes the flap rigid rotation, and the servo's inertia/spring/damping
+    // added to the stepping system. Requires the mesh and the elastic assembly
+    // to be in place, so it is called after assemble_system().
+    void
+    setup_servo_hinges();
+
+    // Add the servo inertia/spring/damping to the augmented stepping system.
+    void
+    add_servo_terms();
+
+    // Advance the servo states by the time step and write theta back into the
+    // elastic displacement, so the flap moves with the actuated hinge.
+    void
+    update_servo_hinges();
 
     // Add a point force (vector) applied at the given point to the RHS
     void
@@ -128,8 +149,16 @@ namespace Linear_Elasticity
 
     AffineConstraints<double> hanging_node_constraints;
 
+    // Hanging-node constraints merged with the servo hinge ties and the
+    // mass-orthogonal gauge that removes the flap rigid rotation. Only used
+    // when `servo_enabled`.
+    AffineConstraints<double> servo_constraints;
+
     // Matrices used during computations
     SparsityPattern      sparsity_pattern;
+    // Augmented (n_elastic_dofs + n_flaps) sparsity pattern: the elastic
+    // pattern plus the fill-in of the servo gauge and the theta rows.
+    SparsityPattern      augmented_sparsity_pattern;
     SparseMatrix<double> mass_matrix;
     SparseMatrix<double> stiffness_matrix;
     SparseMatrix<double> system_matrix;
@@ -157,6 +186,44 @@ namespace Linear_Elasticity
     bool                hinge_enabled;
     std::vector<double> hinge_force_values;
     std::vector<double> hinge_moment_values;
+
+    // Actuated control-surface hinges (rotational DOF + servo). Each control
+    // surface is its own flap: a separate mesh piece (see make_grid()) whose
+    // hinge-line nodes are tied to the airframe. The flap keeps its elastic
+    // bending, and its rigid rotation about the hinge is carried by `theta`, an
+    // extra scalar DOF driven by the servo. A mass-orthogonal gauge removes the
+    // flap's own rigid rotation from the elastic DOFs, so the system stays
+    // symmetric positive definite.
+    struct ServoHinge
+    {
+      Point<dim>            hinge_point; // point on the hinge line
+      Point<dim>            axis;        // hinge line direction (unit)
+      std::size_t           dof = 0;     // index of `theta` in the augmented system
+      // The flap block, used to write the rigid rotation back to the mesh.
+      std::vector<types::global_dof_index> flap_dofs;
+      std::vector<Point<dim>>              flap_points;
+      std::vector<unsigned int>            flap_components;
+      // Coupling vector cg[j] = int rho phi_j (axis x (x - hinge)) dV.
+      std::map<types::global_dof_index, double> cg;
+      double                                    inertia = 0.0; // int rho g.g dV
+    };
+
+    // Augmented dof count: elastic dofs followed by one theta per flap (one
+    // flap per control surface).
+    unsigned int    n_elastic_dofs = 0;
+    unsigned int    n_flaps        = 0;
+    bool            servo_enabled;
+    std::vector<ServoHinge> servo_hinges;
+    // Per control surface, as read from the fluid.
+    std::vector<double>     servo_command_values;
+    std::vector<double>     servo_hinge_moment_axis;
+
+    // The theta row's stepping-matrix entry (flap + reflected servo inertia).
+    std::vector<double> servo_inertia_row;
+
+    // Servo states kept as deal.II vectors so they can take part in the
+    // implicit-coupling checkpoint/reload.
+    Vector<double> servo_theta, servo_omega, servo_cmd;
 
     // In order to measure some timings
     mutable TimerOutput timer;

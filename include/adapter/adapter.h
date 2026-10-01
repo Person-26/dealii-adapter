@@ -218,6 +218,36 @@ namespace Adapter
                     std::vector<double> &hinge_moment);
 
     /**
+     * @brief Enable reading of the servo command angle per control surface.
+     *        The data is received on the hinge mesh (one scalar per surface).
+     */
+    void
+    configure_servo_command(const std::string &command_name);
+
+    /**
+     * @brief Read the servo command angles (one per surface) for the given
+     *        relative read time.
+     */
+    void
+    read_servo_command(double               relative_read_time,
+                       std::vector<double> &command);
+
+    /**
+     * @brief Enable writing of the actual servo angle per control surface on
+     *        the hinge mesh (one scalar per surface), so the fluid can move
+     *        the surface by the angle the servo reached, not the command.
+     */
+    void
+    configure_servo_angle(const std::string &angle_name);
+
+    /**
+     * @brief Write the servo angles (one per surface, in hinge mesh vertex
+     *        order). Call before advance().
+     */
+    void
+    write_servo_angle(const std::vector<double> &angle);
+
+    /**
      * @brief Number of hinge vertices received from preCICE.
      */
     unsigned int
@@ -301,6 +331,14 @@ namespace Adapter
     std::string         hinge_moment_name;
     std::vector<int>    hinge_vertex_ids;
     std::vector<double> hinge_vertex_coords;
+
+    // Optional servo command read on the hinge mesh
+    bool        servo_command_enabled = false;
+    std::string servo_command_name;
+
+    // Optional servo angle written on the hinge mesh
+    bool        servo_angle_enabled = false;
+    std::string servo_angle_name;
 
     /**
      * @brief format_deal_to_precice Formats a global deal.II vector of type
@@ -823,6 +861,66 @@ namespace Adapter
                      hinge_vertex_ids,
                      relative_read_time,
                      hinge_moment);
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::configure_servo_command(
+    const std::string &command_name)
+  {
+    servo_command_enabled = true;
+    servo_command_name    = command_name;
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::read_servo_command(
+    double               relative_read_time,
+    std::vector<double> &command)
+  {
+    if (!servo_command_enabled)
+      return;
+    const int n_hinges = hinge_vertex_ids.size();
+    if (n_hinges == 0)
+      return;
+    command.resize(n_hinges);
+    precice.readData(hinge_mesh_name,
+                     servo_command_name,
+                     hinge_vertex_ids,
+                     relative_read_time,
+                     command);
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::configure_servo_angle(
+    const std::string &angle_name)
+  {
+    servo_angle_enabled = !angle_name.empty();
+    servo_angle_name    = angle_name;
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::write_servo_angle(
+    const std::vector<double> &angle)
+  {
+    if (!servo_angle_enabled || hinge_vertex_ids.empty())
+      return;
+    AssertThrow(angle.size() == hinge_vertex_ids.size(),
+                ExcMessage("One servo angle per hinge vertex is required."));
+    precice.writeData(hinge_mesh_name,
+                      servo_angle_name,
+                      hinge_vertex_ids,
+                      angle);
   }
 
 

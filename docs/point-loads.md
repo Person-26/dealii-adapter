@@ -56,4 +56,11 @@ The hub/hinge vertices must lie **inside the solid mesh** for `add_point_force`
 to find a containing cell (the `PF` scenario of the linear-elasticity solver
 provides a large enough plate; the default tiny `FSI3` flap is too small).
 
-See `../multiphysics/test/flying-sled/README.md` for a complete example.
+The full-3-way mode enables them (`parameters-full.prm`). The flying-sled
+example uses a foam plate that runs through the elevon hinge line, with each
+elevon a flap hinged to the airframe: the hinge moments are read on the
+control mesh and drive the actuated servo hinge (see `setup_servo_hinges()`),
+and with `Enable hinge loads` only the hinge force is applied, at the
+solid-frame `Servo hinge locations` on the hinge line (the moment is not
+applied a second time as a couple). The propeller hubs still lie above the
+plate, so their point loads are not transferred.

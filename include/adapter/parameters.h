@@ -87,6 +87,7 @@ namespace Parameters
   struct PreciceAdapterConfiguration
   {
     std::string scenario         = "FSI3";
+    double      plate_thickness  = 3.0e-3; // Sled foam plate [m]
     std::string config_file      = "precice-config.xml";
     std::string participant_name = "dealiisolver";
     std::string mesh_name        = "dealii-mesh";
@@ -106,6 +107,25 @@ namespace Parameters
     std::string  hinge_mesh_name       = "Control-Mesh";
     std::string  hinge_force_data_name = "HingeForce";
     std::string  hinge_moment_data_name = "HingeMoment";
+
+    // Actuated control-surface hinge: a rotational DOF per surface, driven by a
+    // servo (saturated PD position loop). The aero hinge moment is read on the
+    // hinge mesh and applied to the DOF instead of the elastic body.
+    bool        servo_enabled          = false;
+    std::string servo_command_data_name = "ServoCommand";
+    std::string servo_angle_data_name   = ""; // written back, optional
+    std::vector<double> hinge_axis{0.0, 1.0, 0.0};
+    std::vector<double> servo_hinge_locations; // dim-tuples, flat
+
+    // Servo model parameters (defaults are a small-UAV analogue servo).
+    double servo_kp         = 2.0;
+    double servo_kd         = 0.05;
+    double servo_torque_max = 0.30;
+    double servo_rate_max   = 6.0;
+    double servo_freeplay   = 0.005;
+    double servo_coulomb    = 0.010;
+    double servo_viscous    = 0.002;
+    double servo_inertia    = 2.0e-5;
 
     void
     add_output_parameters(ParameterHandler &prm);

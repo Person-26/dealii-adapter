@@ -36,6 +36,18 @@ ENDIF()
 PROJECT(${TARGET})
 INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}/include)
 
+# The multiphysics repo that carries this adapter as deps/dealii-adapter: its
+# actuators.hpp holds the servo model (rb::servoStep) the hinge servo runs.
+SET(MP_SHARED_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../.." CACHE PATH
+    "Directory containing the multiphysics actuators.hpp")
+IF(NOT EXISTS "${MP_SHARED_INCLUDE_DIR}/actuators.hpp")
+  MESSAGE(FATAL_ERROR "actuators.hpp not found in MP_SHARED_INCLUDE_DIR "
+    "(${MP_SHARED_INCLUDE_DIR}); pass -DMP_SHARED_INCLUDE_DIR=<multiphysics repo>.")
+ENDIF()
+# SYSTEM: deal.II builds with -Wmissing-braces, which the brace-elided
+# std::array initialisers in the shared headers would trip.
+INCLUDE_DIRECTORIES(SYSTEM ${MP_SHARED_INCLUDE_DIR})
+
 # Set the executable
 ADD_EXECUTABLE(${TARGET} ${TARGET_SRC})
 
