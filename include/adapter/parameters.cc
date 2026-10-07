@@ -22,6 +22,23 @@ namespace Parameters
                         output_folder,
                         "Output folder",
                         Patterns::Anything());
+      prm.add_parameter("Checkpoint interval",
+                        checkpoint_interval,
+                        "Write a restart checkpoint every x seconds (0: none)",
+                        Patterns::Double(0));
+      prm.add_parameter("Checkpoint folder",
+                        checkpoint_folder,
+                        "Folder of the restart checkpoints",
+                        Patterns::Anything());
+      prm.add_parameter("Checkpoint time offset",
+                        checkpoint_offset,
+                        "Added to the time in checkpoint names (the start "
+                        "time of a restarted run)",
+                        Patterns::Double());
+      prm.add_parameter("Restart file",
+                        restart_file,
+                        "Checkpoint to start from (empty: from rest)",
+                        Patterns::Anything());
     }
     prm.leave_subsection();
   }
@@ -170,6 +187,13 @@ namespace Parameters
                         write_data_name,
                         "Name of the write data in the precice-config.xml file",
                         Patterns::Anything());
+
+      prm.add_parameter(
+        "Write velocity data name",
+        write_velocity_data_name,
+        "Name of the interface velocity write data in the precice-config.xml "
+        "file (empty: not written)",
+        Patterns::Anything());
 
       prm.add_parameter("Flap location",
                         flap_location,

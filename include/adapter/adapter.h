@@ -91,6 +91,23 @@ namespace Adapter
             const double      computed_timestep_length);
 
     /**
+     * @brief      Write the interface velocity (same layout as the
+     *             displacement) if a velocity write data name is set. Call
+     *             before advance().
+     */
+    void
+    write_velocity(const VectorType &velocity);
+
+    /**
+     * @brief      Whether a velocity write data name is set.
+     */
+    bool
+    writes_velocity() const
+    {
+      return !write_velocity_data_name.empty();
+    }
+
+    /**
      * @brief      Saves current state of time dependent variables in case of an
      *             implicit coupling
      *
@@ -292,6 +309,7 @@ namespace Adapter
     const std::string mesh_name;
     const std::string read_data_name;
     const std::string write_data_name;
+    const std::string write_velocity_data_name;
 
     // To be adjusted for MPI parallelized codes
     static constexpr unsigned int this_mpi_process = 0;
@@ -390,6 +408,7 @@ namespace Adapter
     , mesh_name(parameters.mesh_name)
     , read_data_name(parameters.read_data_name)
     , write_data_name(parameters.write_data_name)
+    , write_velocity_data_name(parameters.write_velocity_data_name)
   {}
 
 
@@ -550,6 +569,23 @@ namespace Adapter
     // Here, we need to specify the computed time step length and pass it to
     // preCICE
     precice.advance(computed_timestep_length);
+  }
+
+
+
+  template <int dim, typename VectorType, typename ParameterClass>
+  void
+  Adapter<dim, VectorType, ParameterClass>::write_velocity(
+    const VectorType &velocity)
+  {
+    if (write_velocity_data_name.empty())
+      return;
+    // advance() refills the buffer with the displacement afterwards.
+    format_deal_to_precice(velocity);
+    precice.writeData(mesh_name,
+                      write_velocity_data_name,
+                      interface_nodes_ids,
+                      write_data_buffer);
   }
 
 

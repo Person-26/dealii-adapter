@@ -1,5 +1,9 @@
 #include "include/linear_elasticity.h"
 
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+
 #include <deal.II/base/function.h>
 #include <deal.II/base/parameter_handler.h>
 #include <deal.II/base/quadrature_lib.h>
@@ -1568,6 +1572,10 @@ namespace Linear_Elasticity
     // place before the stepping matrix is assembled and condensed.
     if (servo_enabled)
       setup_servo_hinges();
+    // A restart continues from a checkpoint; preCICE then gets its
+    // displacement as the initial data (if the coupling asks for it).
+    if (!parameters.restart_file.empty())
+      read_checkpoint(parameters.restart_file);
     output_results();
     assemble_system();
     if (servo_enabled)
@@ -1729,6 +1737,28 @@ namespace Linear_Elasticity
             adapter.write_servo_angle(angle);
           }
 
+        // The interface velocity, for the fluid's predictor: velocity holds
+        // the flaps' bending only (update_servo_hinges() adds their rigid
+        // rotation to the displacement), so add the rotation rate omega*g.
+        if (adapter.writes_velocity())
+          {
+            Vector<double> coupling_velocity = velocity;
+            if (servo_enabled)
+              for (unsigned int s = 0; s < n_flaps; ++s)
+                {
+                  const ServoHinge &sh = servo_hinges[s];
+                  for (std::size_t k = 0; k < sh.flap_dofs.size(); ++k)
+                    {
+                      Point<dim> r = sh.flap_points[k];
+                      r -= sh.hinge_point;
+                      const Point<dim> g = hinge_g<dim>(sh.axis, r);
+                      coupling_velocity[sh.flap_dofs[k]] +=
+                        servo_omega[s] * g[sh.flap_components[k]];
+                    }
+                }
+            adapter.write_velocity(coupling_velocity);
+          }
+
         timer.enter_subsection("Advance adapter");
         adapter.advance(displacement, time.get_delta_t());
         timer.leave_subsection("Advance adapter");
@@ -1744,12 +1774,72 @@ namespace Linear_Elasticity
         if (adapter.precice.isTimeWindowComplete() &&
             time.get_timestep() % parameters.output_interval == 0)
           output_results();
+
+        if (adapter.precice.isTimeWindowComplete() &&
+            parameters.checkpoint_interval > 0)
+          {
+            const double k =
+              std::round(time.current() / parameters.checkpoint_interval);
+            if (k > 0 &&
+                std::abs(time.current() - k * parameters.checkpoint_interval) <
+                  0.25 * time.get_delta_t())
+              write_checkpoint();
+          }
       }
 
     // After the time loop, we finalize the coupling i.e. terminate
     // communication etc.
     adapter.precice.finalize();
   }
+
+  template <int dim>
+  void
+  ElastoDynamics<dim>::write_checkpoint() const
+  {
+    std::ostringstream name;
+    name << std::defaultfloat << std::setprecision(6)
+         << parameters.checkpoint_offset + time.current();
+    const std::string file =
+      parameters.checkpoint_folder + "/" + name.str() + ".solid";
+    std::ofstream out(file + ".tmp", std::ios::binary);
+    displacement.block_write(out);
+    velocity.block_write(out);
+    old_stress.block_write(out);
+    servo_theta.block_write(out);
+    servo_omega.block_write(out);
+    servo_cmd.block_write(out);
+    out.close();
+    AssertThrow(out, ExcMessage("Cannot write the checkpoint " + file));
+    std::rename((file + ".tmp").c_str(), file.c_str());
+  }
+
+
+
+  template <int dim>
+  void
+  ElastoDynamics<dim>::read_checkpoint(const std::string &file)
+  {
+    std::ifstream in(file, std::ios::binary);
+    AssertThrow(in, ExcMessage("Cannot open the checkpoint " + file));
+    const auto read = [&in, &file](Vector<double> &v) {
+      const auto n = v.size();
+      v.block_read(in);
+      AssertThrow(v.size() == n,
+                  ExcMessage("The checkpoint " + file +
+                             " does not fit this mesh / setup"));
+    };
+    read(displacement);
+    read(velocity);
+    read(old_stress);
+    read(servo_theta);
+    read(servo_omega);
+    read(servo_cmd);
+    old_displacement = displacement;
+    old_velocity     = velocity;
+    std::cout << "Restarted from the checkpoint " << file << std::endl;
+  }
+
+
 
   template class ElastoDynamics<DIM>;
 } // namespace Linear_Elasticity

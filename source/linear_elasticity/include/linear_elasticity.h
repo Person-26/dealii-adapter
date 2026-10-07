@@ -109,6 +109,13 @@ namespace Linear_Elasticity
     void
     add_servo_terms();
 
+    // Write / read the state a restart needs (displacement, velocity, the
+    // previous load and the servo states), see Parameters::Time.
+    void
+    write_checkpoint() const;
+    void
+    read_checkpoint(const std::string &file);
+
     // Advance the servo states by the time step and write theta back into the
     // elastic displacement, so the flap moves with the actuated hinge.
     void

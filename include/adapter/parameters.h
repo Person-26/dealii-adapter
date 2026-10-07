@@ -20,6 +20,14 @@ namespace Parameters
     double      delta_t         = 0.1;
     int         output_interval = 1;
     std::string output_folder   = "";
+    // Checkpoints of the solver state for a restart (0: none): written
+    // every checkpoint_interval [s] to checkpoint_folder/<t>.solid, with t
+    // the time plus checkpoint_offset (a restarted run's start time);
+    // restart_file loads one before the coupling starts.
+    double      checkpoint_interval = 0;
+    std::string checkpoint_folder   = "";
+    double      checkpoint_offset   = 0;
+    std::string restart_file        = "";
 
 
     void
@@ -93,6 +101,9 @@ namespace Parameters
     std::string mesh_name        = "dealii-mesh";
     std::string read_data_name   = "Stress";
     std::string write_data_name  = "Displacement";
+    // Optional: also write the interface velocity under this name (empty:
+    // not written), for the fluid's predictor across a parallel window
+    std::string write_velocity_data_name = "";
     double      flap_location    = 0.0;
     bool        data_consistent  = true;
 
